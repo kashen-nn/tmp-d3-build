@@ -1,0 +1,259 @@
+name: game-build
+
+# Build the Diablo III (01001B300B9BE000, v1441792 = 2.7.7.92380) IPA with
+# the upstream nxnative engine on a GitHub Actions macOS runner.
+# Inputs arrive as this repo's "d3-assets" release (d3_assets.zip):
+# a dump folder (the update's ExeFS extracted on the owner's PC with
+# hactool — keys never leave his PC — plus a stub RomFS tree of empty
+# .cpk placeholders with the real file names; the real RomFS image is
+# supplied on the phone, --romfs separate), a hand-fixed game profile
+# under profile/ (DM_GAMES_DIR), and env.txt (DM_ENV_FILE).
+# The pipeline's shader split cannot read Diablo III's Blizzard SNO
+# shaders (inside its CPKs) and stops there by design; that stop is
+# expected. The pack step then bypasses the shader stages: it calls
+# dm/ios/tools/build_ipa.sh directly with the pipeline's own extract +
+# rewrite outputs and the shader libraries transplanted from the
+# author's v1.1.0 build (assets: msl/b-3ee493b2c3a4, chain strings
+# rewritten to the current chain, inputs stamp matching the profile).
+# Outputs are published as assets of this repo's d3-game-output
+# release (the Actions artifact quota is exhausted).
+# SDK 26 compatibility: the pinned upstream targets the iOS 27 SDK, so
+# the same line-removal patch as engine-build is applied to the cloud
+# checkout only.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write # to commit LAST_GAME_BUILD.md back to main
+
+env:
+  UPSTREAM_REPO: seedds/nxnative
+  UPSTREAM_REF: d777f0a340e87f3d87ebd8905f2a99b9ba497134
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 300
+    steps:
+      - name: Checkout this repo (result commit-back target)
+        uses: actions/checkout@v4
+        with:
+          path: self
+
+      - name: Checkout upstream nxnative (pinned commit)
+        uses: actions/checkout@v4
+        with:
+          repository: seedds/nxnative
+          ref: d777f0a340e87f3d87ebd8905f2a99b9ba497134
+          path: upstream
+
+      - name: Download the game assets (this repo's d3-assets release)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/game"
+          gh release download d3-assets --repo kashen-nn/tmp-d3-build --pattern d3_assets.zip --dir "$GITHUB_WORKSPACE/game"
+          cd "$GITHUB_WORKSPACE/game" && unzip -q d3_assets.zip && rm d3_assets.zip
+          find . -maxdepth 3 | sort | head -30
+          ls -la dump/updates/1441792/exefs profile/01001B300B9BE000
+
+      - name: Patch the upstream checkout (SDK 26 compat + cheat panel frontend)
+        run: |
+          set -o pipefail
+          mkdir -p "$GITHUB_WORKSPACE/results"
+          python3 "$GITHUB_WORKSPACE/game/tools/patch_frontend.py" \
+            "$GITHUB_WORKSPACE/upstream" "$GITHUB_WORKSPACE/game" \
+            2>&1 | tee "$GITHUB_WORKSPACE/results/patch.log"
+
+      - name: Select newest Xcode and record toolchain
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/results"
+          latest="$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)"
+          echo "available Xcodes:"; ls -d /Applications/Xcode*.app 2>/dev/null || true
+          if [ -n "$latest" ]; then sudo xcode-select -s "$latest/Contents/Developer"; fi
+          {
+            echo "date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "runner: $RUNNER_OS $RUNNER_ARCH"
+            sw_vers
+            xcodebuild -version
+            echo "iphoneos SDK: $(xcrun --sdk iphoneos --show-sdk-version 2>&1)"
+            echo "upstream ref: $UPSTREAM_REF"
+            python3 --version
+            dotnet --version 2>&1 || echo "dotnet: not preinstalled"
+          } 2>&1 | tee "$GITHUB_WORKSPACE/results/toolchain.log"
+
+      - name: Set up Python 3.13 (the pipeline's deps have no Python 3.15 wheels)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install build tools (xcodegen, zstd, glslang, .NET 10, python deps)
+        run: |
+          set -e
+          brew install xcodegen zstd glslang 2>&1 | tail -3
+          if ! dotnet --list-sdks 2>/dev/null | grep -q '^10\.'; then
+            curl -sSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
+            bash /tmp/dotnet-install.sh --channel 10.0 --install-dir "$HOME/.dotnet" 2>&1 | tail -2
+          fi
+          echo "$HOME/.dotnet" >> "$GITHUB_PATH"
+          python3 --version
+          python3 -m pip install --quiet lz4 "capstone>=5,<6" fonttools zbic backports.zstd
+          dotnet --version
+
+      - name: Verify python deps (fail loudly if a module is missing)
+        run: |
+          python3 -c "import lz4.block, capstone, fontTools, zbic, backports.zstd; print('py deps ok:', __import__('capstone').__version__)"
+          python3 -m pip list 2>/dev/null | grep -Ei 'lz4|capstone|fonttools|zbic|backports' || true
+
+      - name: Metal toolchain component (Xcode 26 keeps it separate; best effort)
+        run: xcodebuild -downloadComponent MetalToolchain 2>&1 | tail -3 || true
+
+      - name: Run the upstream pipeline (stops at the shader split - expected)
+        run: |
+          set +e
+          R="$GITHUB_WORKSPACE/results"
+          export PATH="$HOME/.dotnet:$PATH"
+          export DM_GAMES_DIR="$GITHUB_WORKSPACE/game/profile"
+          export DM_ENV_FILE="$GITHUB_WORKSPACE/game/env.txt"
+          cd upstream
+          python3 scripts/build_ipa_from_nsp.py "$GITHUB_WORKSPACE/game/dump" \
+            --romfs separate --no-heap-check --allow-other-metal \
+            2>&1 | tee "$R/orchestrator.log"
+          echo "${PIPESTATUS[0]}" > "$R/orchestrator.exit"
+          echo "orchestrator exit: $(cat "$R/orchestrator.exit") (1 at the shader split is expected: Diablo III's SNO shaders are unreadable to shader_split.py; the pack step below bypasses the shader stages)"
+          exit 0
+
+      - name: Bypass - pack the IPA with build_ipa.sh and the transplanted shader libraries
+        run: |
+          set +e
+          R="$GITHUB_WORKSPACE/results"
+          WS="$GITHUB_WORKSPACE"
+          export PATH="$HOME/.dotnet:$PATH"
+          BUILD="$(echo "$WS"/game/dump/*_build)"
+          PATCHED="$(dirname "$(find "$BUILD" -name main.fixups.tsv -path '*patched*' | head -1)")"
+          ROMFS_IMG="$(find "$BUILD" -name RomFS.img | head -1)"
+          echo "build dir: $BUILD"; echo "patched: $PATCHED"; echo "romfs image: $ROMFS_IMG"
+          EXPECTED="$(tr -d '[:space:]' < "$WS/game/panel/expected_main_patched_sha256.txt")"
+          ACTUAL="$(shasum -a 256 "$PATCHED/main.patched.bin" | awk '{print $1}')"
+          echo "main.patched.bin sha256: $ACTUAL (toggle build expects $EXPECTED)" | tee "$R/build_ipa.log"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "TOGGLE ABORT: the cloud rewrite differs from the image the toggle build was compiled against; not packing" | tee -a "$R/build_ipa.log"
+            echo "9" > "$R/build_ipa.exit"
+            exit 0
+          fi
+          cp "$WS/game/panel/main.toggle.bin" "$PATCHED/main.patched.bin"
+          echo "toggle image staged over main.patched.bin" | tee -a "$R/build_ipa.log"
+          mkdir -p "$BUILD/sh/ios"
+          cp -R "$WS/game/msl/b-3ee493b2c3a4" "$BUILD/sh/ios/"
+          cd upstream
+          env GAME=01001B300B9BE000 W="$BUILD/ipa" PATCHED="$PATCHED" ROMFS="$ROMFS_IMG" \
+            CHEATS_DIR="$WS/game/panel/cheats" SKIN_DIR="$WS/game/skin" \
+            MSL_IOS="$BUILD/sh/ios" GFXAPI=nvn FONT_PY=python3 \
+            DM_DISPLAY_NAME="Diablo III: Eternal Collection" DM_APP_VERSION=2.2.0 \
+            DM_BUNDLE_ID=org.nxnative.01001b300b9be000 AOC= \
+            DM_XCODE_DERIVED_DATA="$BUILD/xcode-derived-data" DM_TEAM_ID=0000000000 \
+            DM_LANG=en-US CONTROL="$BUILD/extract/v1441792/control.nacp" \
+            DM_COPY_ROMFS=NO DM_ENV_FILE="$WS/game/env.txt" DM_SHOW_FPS=0 DM_PSO_GPUS=none \
+            DM_GAMES_DIR="$WS/game/profile" \
+            bash dm/ios/tools/build_ipa.sh "$WS/game/dump/DiabloIII.ipa" 2>&1 | tee -a "$R/build_ipa.log"
+          echo "${PIPESTATUS[0]}" > "$R/build_ipa.exit"
+          echo "build_ipa.sh exit: $(cat "$R/build_ipa.exit")"
+          ls -la "$WS/game/dump"/*.ipa 2>/dev/null || echo "no IPA produced"
+          exit 0
+
+      - name: Finish the IPA (romfs.id, Chinese launcher, app icon)
+        if: always()
+        run: |
+          set +e
+          R="$GITHUB_WORKSPACE/results"
+          WS="$GITHUB_WORKSPACE"
+          IPA="$WS/game/dump/DiabloIII.ipa"
+          if [ -f "$IPA" ]; then
+            python3 "$WS/game/tools/ipa_finish.py" "$IPA" "$WS/game" 2>&1 | tee "$R/ipa_finish.log"
+            echo "ipa_finish exit: ${PIPESTATUS[0]}" | tee -a "$R/ipa_finish.log"
+          else
+            echo "no IPA to finish" | tee "$R/ipa_finish.log"
+          fi
+          exit 0
+
+      - name: Collect the IPA
+        if: always()
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/results/ipa"
+          for f in "$GITHUB_WORKSPACE/game/dump"/*.ipa; do
+            [ -f "$f" ] || continue
+            cp "$f" "$GITHUB_WORKSPACE/results/ipa/"
+            shasum -a 256 "$f"
+          done
+          ls -la "$GITHUB_WORKSPACE/results/ipa" 2>/dev/null || true
+
+      - name: Publish the IPA and logs to the d3-game-output release
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          R="$GITHUB_WORKSPACE/results"
+          gh release view d3-game-output --repo kashen-nn/tmp-d3-build >/dev/null 2>&1 || \
+            gh release create d3-game-output --repo kashen-nn/tmp-d3-build \
+              --title "Diablo III new-engine build output" \
+              --notes "Cloud-built IPA (unsigned) and build logs of the game-build workflow. The IPA still needs the local shader/romfs.id finishing steps before install."
+          files=()
+          for f in "$R"/ipa/*.ipa "$R"/orchestrator.log "$R"/build_ipa.log "$R"/toolchain.log "$R"/patch.log "$R"/ipa_finish.log; do
+            [ -f "$f" ] && files+=("$f")
+          done
+          echo "publishing: ${files[*]}"
+          if [ ${#files[@]} -gt 0 ]; then
+            gh release upload d3-game-output "${files[@]}" --repo kashen-nn/tmp-d3-build --clobber
+          fi
+          exit 0
+
+      - name: Write LAST_GAME_BUILD.md and commit it back
+        if: always()
+        run: |
+          R="$GITHUB_WORKSPACE/results"
+          get() { if [ -f "$R/$1" ]; then cat "$R/$1"; else echo "n/a"; fi; }
+          oe="$(get orchestrator.exit)"
+          be="$(get build_ipa.exit)"
+          ipa_line="none"
+          for f in "$R"/ipa/*.ipa; do
+            [ -f "$f" ] || continue
+            ipa_line="$(basename "$f") $(stat -f %z "$f" 2>/dev/null || stat -c %s "$f") bytes sha256 $(shasum -a 256 "$f" | awk '{print $1}')"
+          done
+          if [ "$be" = "0" ]; then verdict="PASS - panel build: toggle image + cheat pack + glass panel + Chinese launcher + icon + romfs.id (release d3-game-output)"; else verdict="FAIL or PARTIAL - see build_ipa.log tail below"; fi
+          {
+            echo "# Last game cloud build (Diablo III, new engine)"
+            echo
+            cat "$R/toolchain.log" 2>/dev/null
+            echo
+            echo "- orchestrator exit: $oe (1 at the shader split is expected; the pack is done by the bypass step)"
+            echo "- build_ipa.sh exit: $be"
+            echo "- IPA: $ipa_line"
+            echo "- verdict: $verdict"
+            echo
+            echo "## patch.log (SDK 26 compatibility patches)"
+            echo '```'
+            cat "$R/patch.log" 2>/dev/null
+            echo '```'
+            echo
+            echo "## build_ipa.log (last 100 lines)"
+            echo '```'
+            tail -n 100 "$R/build_ipa.log" 2>/dev/null
+            echo '```'
+            echo
+            echo "## orchestrator.log (last 40 lines)"
+            echo '```'
+            tail -n 40 "$R/orchestrator.log" 2>/dev/null
+            echo '```'
+          } > "$GITHUB_WORKSPACE/LAST_GAME_BUILD.md"
+          cd self
+          cp "$GITHUB_WORKSPACE/LAST_GAME_BUILD.md" .
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add LAST_GAME_BUILD.md
+          git commit -m "game build result [skip ci]" || echo "nothing to commit"
+          for i in 1 2 3 4; do
+            if git pull --rebase origin main && git push; then echo "report pushed (attempt $i)"; break; fi
+            echo "push attempt $i failed; retrying"; sleep 5
+          done
