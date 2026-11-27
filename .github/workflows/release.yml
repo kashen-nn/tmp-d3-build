@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@v7
       - name: Unpack source pack
         run: |
-          cat house_pack_*.txt | base64 -d | tar xz
+          cat house_pack_*.txt | base64 -d | tar xz --exclude='./src-tauri/icons/32x32.png.b64' --exclude='./src-tauri/icons/128x128.png.b64' --exclude='./src-tauri/icons/128x128@2x.png.b64'
           rm -f house_pack_*.txt house-probe.txt
           ls src-tauri/icons/ios/ | wc -l
       - name: Restore binary files
