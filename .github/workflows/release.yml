@@ -1,0 +1,57 @@
+name: Build House iOS IPA
+
+on:
+  push:
+    branches: [house-build]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  ios:
+    name: iOS (Unsigned IPA)
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    steps:
+      - uses: actions/checkout@v7
+      - name: Unpack source pack
+        run: |
+          cat house_pack_*.txt | base64 -d | tar xz
+          rm -f house_pack_*.txt house-probe.txt
+          ls src-tauri/icons/ios/ | wc -l
+      - name: Restore binary files
+        run: |
+          find . -name '*.b64' -print0 | while IFS= read -r -d '' f; do
+            base64 -d "$f" > "${f%.b64}"
+            rm "$f"
+          done
+          ls src-tauri/icons/ios/ | head -3
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ./src-tauri -> target
+      - name: Ensure iOS CLI dependencies
+        run: |
+          for pkg in xcodegen libimobiledevice cocoapods; do
+            brew list "$pkg" >/dev/null 2>&1 || brew install "$pkg"
+          done
+      - run: npm ci
+      - name: Build unsigned iOS IPA
+        run: bash scripts/build-ios-ipa.sh
+      - name: Publish IPA to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create house-v0.2.2 src-tauri/target/ios/account-manager-ios-unsigned.ipa \
+            --title "House v0.2.2 (fingerprint build)" \
+            --notes "Unsigned IPA. Install with SideStore over the existing app (same bundle ID com.ldjx.accountmanager)."
